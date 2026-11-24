@@ -448,6 +448,7 @@ class Gen:
         self.f16_half_outs = {}     # VS/MS, --f16-interp-fallback: param n -> its two decoded-half output names
         self.ij_capture = {}        # computed-I/J pairs: pair key -> the I float id the p1 loaded (SHADER-177)
         self.uses_psb = False
+        self.uses_int64_atomics = False
         self.uses_active = False
         self.vm_latch = False      # PS: EXEC can change after a `vm` or color export, so EXEC at those is kept
         self.col_latched = []      # PS with vm_latch: the color targets (mrtN) whose export EXEC is kept
@@ -3203,7 +3204,7 @@ class Gen:
         forms (add/sub/min/max carry or compare across the dwords, cmpswap_x2 compares all 64 bits) and inc/dec stay
         Unsupported. fcmpswap compares as binary32 (float_cmpswap_loop)."""
         kind = op[len("global_atomic_"):]
-        if kind in ("and_x2", "or_x2", "xor_x2", "swap_x2"):
+        if kind.endswith("_x2"):
             return self.global_atomic_x2(op, kind[:-3], a, mods)
         if kind in ("fmin", "fmax"):
             return self.global_atomic_float(op, kind, a, mods)
@@ -3273,20 +3274,44 @@ class Gen:
         if vdst is not None:
             self.dst(vdst, old)
 
+    def pack_u64(self, lo, hi):
+        """Pack two 32-bit uint values (lo, hi) into a 64-bit %ulong."""
+        l64, h64, t, val64 = (self.tmp() for _ in range(4))
+        self.emit(f"{l64} = OpUConvert %ulong {lo}")
+        self.emit(f"{h64} = OpUConvert %ulong {hi}")
+        self.emit(f"{t} = OpShiftLeftLogical %ulong {h64} %c64_32")
+        self.emit(f"{val64} = OpBitwiseOr %ulong {t} {l64}")
+        return val64
+
+    def unpack_u64(self, v64):
+        """Unpack a 64-bit %ulong into low and high 32-bit %uint values."""
+        rlo, rh, rhi = (self.tmp() for _ in range(3))
+        self.emit(f"{rlo} = OpUConvert %uint {v64}")
+        self.emit(f"{rh} = OpShiftRightLogical %ulong {v64} %c64_32")
+        self.emit(f"{rhi} = OpUConvert %uint {rh}")
+        return rlo, rhi
+
     def global_atomic_x2(self, op, kind, a, mods):
-        """global_atomic_{and,or,xor,swap}_x2 (see global_atomic): one 32-bit atomic per dword of the element."""
-        if any(m in mods for m in ("slc", "dlc", "lds")):
+        """global_atomic_<op>_x2 [vdst,] vaddr, vdata, saddr|off [offset:N] [glc]: 64-bit atomic at the global_* address
+        (RDNA2 ISA, FLAT/GLOBAL). With glc the pre-op value lands in vdst[0:1]. cmpswap_x2 takes vdata as a 4-VGPR quad
+        {DATA[63:0], CMP[63:0]}: M = (M == CMP) ? DATA : M. Inactive lanes don't touch memory and keep vdst; active
+        unaligned lanes (addr % 8 != 0) leave memory untouched and write (0, 0) to vdst (measured natively on gfx1036).
+        Lowered to native SPIR-V Int64Atomics operations (OpAtomicIAdd, OpAtomicCompareExchange, etc.) on
+        PhysicalStorageBuffer."""
+        if kind not in self.BUF_ATOMICS or any(m in mods for m in ("slc", "dlc", "lds")):
             raise Unsupported(op + " form")
         rtn = "glc" in mods
         if len(a) != (4 if rtn else 3):
             raise Unsupported(op + " operands")
         vdst, vaddr, vdata, saddr = a if rtn else (None,) + tuple(a)
-        if vdata["k"] != "vgpr" or vdata.get("n", 1) != 2 or \
+        expected_n = 4 if kind == "cmpswap" else 2
+        if vdata["k"] != "vgpr" or vdata.get("n", 1) != expected_n or \
                 (vdst is not None and (vdst["k"] != "vgpr" or vdst.get("n", 1) != 2)):
             raise Unsupported(op + " operands")
         full = self.global_address(op, vaddr, saddr, mods)
-        vals = [self.load_reg("vgpr", vdata["r"] + w) for w in range(2)]
-        spv = self.BUF_ATOMICS[kind][0]
+        vals = [self.load_reg("vgpr", vdata["r"] + w) for w in range(expected_n)]
+        val64 = self.pack_u64(vals[0], vals[1])
+        cmp64 = self.pack_u64(vals[2], vals[3]) if kind == "cmpswap" else None
         al = self.atomic_aligned(full, 8)
         cond = self.tmp()
         self.emit(f"{cond} = OpLogicalAnd %bool {self.active_b()} {al}")
@@ -3295,25 +3320,37 @@ class Gen:
         self.emit(f"OpSelectionMerge {lbl_end} None")
         self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
         self.emit(f"{lbl_do} = OpLabel")
-        ptr = self.tmp()
-        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(full, 'rmw', 8)}")
-        res = []
-        for w in range(2):
-            p, r = self.tmp(), self.tmp()
-            self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(w)}")
-            self.emit(f"{r} = {spv} %uint {p} {self.cu(1)} {self.cu(0)} {vals[w]}")
-            res.append(r)
-        res = [self.guard_zero(r) for r in res]
+        self.uses_int64_atomics = True
+        self.uses_psb = True
+        res64 = self.tmp()
+        if kind in ("smin", "smax"):
+            ptr_long, p_long, val_long, res_long = (self.tmp() for _ in range(4))
+            self.emit(f"{ptr_long} = OpConvertUToPtr %_ptr_PSB_arr_long {self.host_addr(full, 'rmw', 8)}")
+            self.emit(f"{p_long} = OpAccessChain %_ptr_PSB_long {ptr_long} {self.cu(0)}")
+            self.emit(f"{val_long} = OpBitcast %long {val64}")
+            spv = "OpAtomicSMin" if kind == "smin" else "OpAtomicSMax"
+            self.emit(f"{res_long} = {spv} %long {p_long} {self.cu(1)} {self.cu(0)} {val_long}")
+            self.emit(f"{res64} = OpBitcast %ulong {res_long}")
+        elif kind == "cmpswap":
+            ptr, p = self.tmp(), self.tmp()
+            self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr_ulong {self.host_addr(full, 'rmw', 8)}")
+            self.emit(f"{p} = OpAccessChain %_ptr_PSB_ulong {ptr} {self.cu(0)}")
+            self.emit(f"{res64} = OpAtomicCompareExchange %ulong {p} {self.cu(1)} {self.cu(0)} {self.cu(0)} {val64} {cmp64}")
+        else:
+            ptr, p = self.tmp(), self.tmp()
+            self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr_ulong {self.host_addr(full, 'rmw', 8)}")
+            self.emit(f"{p} = OpAccessChain %_ptr_PSB_ulong {ptr} {self.cu(0)}")
+            spv = self.BUF_ATOMICS[kind][0]
+            self.emit(f"{res64} = {spv} %ulong {p} {self.cu(1)} {self.cu(0)} {val64}")
+        res64 = self.guard_zero(res64, "%ulong")
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
-        olds = []
-        for w in range(2):                     # both OpPhi first: they must open the merge block
-            old = self.tmp()
-            self.emit(f"{old} = OpPhi %uint {res[w]} {lbl_do} {self.cu(0)} {pre}")
-            olds.append(old)
+        old64 = self.tmp()
+        self.emit(f"{old64} = OpPhi %ulong {res64} {lbl_do} {self.cl(0)} {pre}")
         if vdst is not None:
-            for w in range(2):
-                self.dst({"k": "vgpr", "r": vdst["r"] + w, "n": 1}, olds[w])
+            rlo, rhi = self.unpack_u64(old64)
+            self.dst({"k": "vgpr", "r": vdst["r"], "n": 1}, rlo)
+            self.dst({"k": "vgpr", "r": vdst["r"] + 1, "n": 1}, rhi)
 
     def float_cmpswap_loop(self, p, new, cmp, scope):
         """tmp = M; M = (tmp == CMP as binary32) ? NEW : tmp; returns tmp (RDNA2 ISA, *_FCMPSWAP / DS_CMPST_F32). A
@@ -3347,7 +3384,7 @@ class Gen:
         address). With 'glc' the pre-op value is returned in vdata. Inactive lanes don't touch memory and keep vdata;
         active OOB or unaligned (addr % 4 != 0) lanes leave memory untouched and write 0 with glc (measured on gfx1036)."""
         kind = op[len("buffer_atomic_"):]
-        if kind in ("and_x2", "or_x2", "xor_x2", "swap_x2"):
+        if kind.endswith("_x2"):
             return self.buffer_atomic_x2(op, kind[:-3], a, mods)
         if kind in ("fmin", "fmax"):
             return self.buffer_atomic_float(op, kind, a, mods)
@@ -3417,19 +3454,21 @@ class Gen:
             self.dst({"k": "vgpr", "r": vd["r"], "n": 1}, old)
 
     def buffer_atomic_x2(self, op, kind, a, mods):
-        """buffer_atomic_{and,or,xor,swap}_x2 vdata[0:1], vaddr, s[V#], soffset: M = op(M, DATA) on the 64-bit element
-        (two dwords, low first); with glc the old 64 bits are returned in vdata. Each dword is its own 32-bit atomic, so
-        no Int64 atomics are needed. That leaves the same memory for a bitwise op, whose bits are independent, but an
-        exchange can tear: two lanes swapping into one element at once can leave one's low dword with the other's high
-        dword (A.lo, B.lo, B.hi, A.hi). The returned pair is two reads, so another lane's 64-bit op on the same element
-        between them could be seen half done. Measured natively on RDNA2 (gfx1036, wave32 & wave64): the bounds check
-        covers the whole 8-byte element all or nothing (fixed_fmt=62) and addresses with (addr & 7) != 0 are dropped
-        (memory untouched, active glc returns (0, 0), inactive preserves vdata)."""
+        """buffer_atomic_<op>_x2 vdata, vaddr, s[V#], soffset ...: 64-bit atomic at the element address (MUBUF).
+        With glc the old 64 bits come back in vdata[0:1]. cmpswap_x2 takes vdata as a 4-VGPR quad
+        {DATA[63:0], CMP[63:0]}. The bounds check covers the whole 8-byte element all or nothing (fixed_fmt=62)
+        and addresses with (addr & 7) != 0 leave memory untouched (active glc returns (0, 0), inactive preserves vdata).
+        Lowered to native SPIR-V Int64Atomics operations on PhysicalStorageBuffer."""
+        if kind not in self.BUF_ATOMICS:
+            raise Unsupported(op + " form")
         vd = a[0]
-        if vd["k"] != "vgpr" or vd.get("n", 1) != 2:
+        expected_n = 4 if kind == "cmpswap" else 2
+        if vd["k"] != "vgpr" or vd.get("n", 1) != expected_n:
             raise Unsupported(op + " data")
         addr, _, in_b, _ = self.buffer_address(a, mods, elem="fmt", fixed_fmt=62)  # step: as buffer_atomic
-        vals = [self.load_reg("vgpr", vd["r"] + w) for w in range(2)]
+        vals = [self.load_reg("vgpr", vd["r"] + w) for w in range(expected_n)]
+        val64 = self.pack_u64(vals[0], vals[1])
+        cmp64 = self.pack_u64(vals[2], vals[3]) if kind == "cmpswap" else None
         al = self.atomic_aligned(addr, 8)
         ok, cond = self.tmp(), self.tmp()
         self.emit(f"{ok} = OpLogicalAnd %bool {in_b} {al}")
@@ -3439,26 +3478,37 @@ class Gen:
         self.emit(f"OpSelectionMerge {lbl_end} None")
         self.emit(f"OpBranchConditional {cond} {lbl_do} {lbl_end}")
         self.emit(f"{lbl_do} = OpLabel")
-        ptr = self.tmp()
-        self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr {self.host_addr(addr, 'rmw', 8)}")
-        res = []
-        for w in range(2):
-            p, r = self.tmp(), self.tmp()
-            self.emit(f"{p} = OpAccessChain %_ptr_PSB_uint {ptr} {self.cu(w)}")
-            self.emit(f"{r} = {self.BUF_ATOMICS[kind][0]} %uint {p} {self.cu(1)} {self.cu(0)} {vals[w]}")
-            res.append(r)
-        res = [self.guard_zero(r) for r in res]
+        self.uses_int64_atomics = True
+        self.uses_psb = True
+        res64 = self.tmp()
+        if kind in ("smin", "smax"):
+            ptr_long, p_long, val_long, res_long = (self.tmp() for _ in range(4))
+            self.emit(f"{ptr_long} = OpConvertUToPtr %_ptr_PSB_arr_long {self.host_addr(addr, 'rmw', 8)}")
+            self.emit(f"{p_long} = OpAccessChain %_ptr_PSB_long {ptr_long} {self.cu(0)}")
+            self.emit(f"{val_long} = OpBitcast %long {val64}")
+            spv = "OpAtomicSMin" if kind == "smin" else "OpAtomicSMax"
+            self.emit(f"{res_long} = {spv} %long {p_long} {self.cu(1)} {self.cu(0)} {val_long}")
+            self.emit(f"{res64} = OpBitcast %ulong {res_long}")
+        elif kind == "cmpswap":
+            ptr, p = self.tmp(), self.tmp()
+            self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr_ulong {self.host_addr(addr, 'rmw', 8)}")
+            self.emit(f"{p} = OpAccessChain %_ptr_PSB_ulong {ptr} {self.cu(0)}")
+            self.emit(f"{res64} = OpAtomicCompareExchange %ulong {p} {self.cu(1)} {self.cu(0)} {self.cu(0)} {val64} {cmp64}")
+        else:
+            ptr, p = self.tmp(), self.tmp()
+            self.emit(f"{ptr} = OpConvertUToPtr %_ptr_PSB_arr_ulong {self.host_addr(addr, 'rmw', 8)}")
+            self.emit(f"{p} = OpAccessChain %_ptr_PSB_ulong {ptr} {self.cu(0)}")
+            spv = self.BUF_ATOMICS[kind][0]
+            self.emit(f"{res64} = {spv} %ulong {p} {self.cu(1)} {self.cu(0)} {val64}")
+        res64 = self.guard_zero(res64, "%ulong")
         self.emit(f"OpBranch {lbl_end}")
         self.emit(f"{lbl_end} = OpLabel")
-        olds = []
-        for w in range(2):                     # both OpPhi first: they must open the merge block
-            old = self.tmp()
-            # an inactive, out-of-range or unaligned lane skips the atomic (active gets 0, inactive keeps vdata via dst)
-            self.emit(f"{old} = OpPhi %uint {res[w]} {lbl_do} {self.cu(0)} {pre}")
-            olds.append(old)
+        old64 = self.tmp()
+        self.emit(f"{old64} = OpPhi %ulong {res64} {lbl_do} {self.cl(0)} {pre}")
         if "glc" in mods:
-            for w in range(2):
-                self.dst({"k": "vgpr", "r": vd["r"] + w, "n": 1}, olds[w])
+            rlo, rhi = self.unpack_u64(old64)
+            self.dst({"k": "vgpr", "r": vd["r"], "n": 1}, rlo)
+            self.dst({"k": "vgpr", "r": vd["r"] + 1, "n": 1}, rhi)
 
     def current_label_placeholder(self):
         """Label of the block currently being emitted (needed for OpPhi). Blocks are opened by OpLabel lines;
@@ -16217,6 +16267,8 @@ def assemble(gen):
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformArithmetic") if c not in caps]
     if gen.uses_quad:
         caps += [c for c in ("GroupNonUniform", "GroupNonUniformQuad") if c not in caps]
+    if gen.uses_int64_atomics:
+        caps.append("Int64Atomics")
     if gen.uses_f64:
         caps.append("Float64")
     if gen.uses_fma_khr:
@@ -16386,6 +16438,14 @@ def assemble(gen):
                   "%rt_uint = OpTypeRuntimeArray %uint", "%_ptr_PSB_arr = OpTypePointer PhysicalStorageBuffer %rt_uint",
                   "%_ptr_PSB_uint = OpTypePointer PhysicalStorageBuffer %uint"]
         dec.append("OpDecorate %rt_uint ArrayStride 4")
+        if gen.uses_int64_atomics:
+            types += ["%rt_ulong = OpTypeRuntimeArray %ulong",
+                      "%_ptr_PSB_arr_ulong = OpTypePointer PhysicalStorageBuffer %rt_ulong",
+                      "%_ptr_PSB_ulong = OpTypePointer PhysicalStorageBuffer %ulong",
+                      "%rt_long = OpTypeRuntimeArray %long",
+                      "%_ptr_PSB_arr_long = OpTypePointer PhysicalStorageBuffer %rt_long",
+                      "%_ptr_PSB_long = OpTypePointer PhysicalStorageBuffer %long"]
+            dec += ["OpDecorate %rt_ulong ArrayStride 8", "OpDecorate %rt_long ArrayStride 8"]
         types += [f"{name} = OpConstant %ulong {v}" for v, name in sorted(gen.lconsts.items())]
     if tex:
         # Bindless set 0: images (binding 0), samplers (binding 1), descriptor hash table (binding 2).
