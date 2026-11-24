@@ -518,16 +518,20 @@ bool VulkanPresentationSwapchain::acquire_next_image(std::uint32_t& out_image_in
 
 VkResult VulkanPresentationSwapchain::present(std::uint32_t back_buffer_index,
                                               VkSemaphore wait_semaphore) {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     if (!initialized_) return VK_ERROR_INITIALIZATION_FAILED;
 
     const std::uint32_t idx = (back_buffer_index < images_.size()) ? back_buffer_index : acquired_index_;
     if (idx >= images_.size()) return VK_ERROR_UNKNOWN;
 
+    const VkImage current_img = images_[idx];
+    auto callback_snapshot = frame_callback_;
+
     if (headless_) {
-        if (frame_callback_) frame_callback_(idx, images_[idx]);
-        if (capture_enabled_) capture_image_to_buffer(images_[idx]);
+        if (capture_enabled_) capture_image_to_buffer(current_img);
         ++presentation_count_;
+        lock.unlock();
+        if (callback_snapshot) callback_snapshot(idx, current_img);
         return VK_SUCCESS;
     }
 
@@ -544,9 +548,10 @@ VkResult VulkanPresentationSwapchain::present(std::uint32_t back_buffer_index,
 
     const VkResult r = fn_.queue_present(queue_, &pi);
     if (r == VK_SUCCESS || r == VK_SUBOPTIMAL_KHR) {
-        if (frame_callback_) frame_callback_(idx, images_[idx]);
-        if (capture_enabled_) capture_image_to_buffer(images_[idx]);
+        if (capture_enabled_) capture_image_to_buffer(current_img);
         ++presentation_count_;
+        lock.unlock();
+        if (callback_snapshot) callback_snapshot(idx, current_img);
     }
     return r;
 }

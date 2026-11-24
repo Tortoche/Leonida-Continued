@@ -95,7 +95,7 @@ bool VulkanPresenterFunctions::load(PFN_vkGetInstanceProcAddr gipa, VkInstance i
            create_image_view && destroy_image_view && create_fence && destroy_fence &&
            wait_for_fences && reset_fences && create_semaphore && destroy_semaphore &&
            queue_submit && device_wait_idle && mem_props && create_cmd_pool && destroy_cmd_pool &&
-           alloc_cmd_bufs && begin_cmd_buf && end_cmd_buf && cmd_barrier;
+           alloc_cmd_bufs && reset_cmd_buf && begin_cmd_buf && end_cmd_buf && cmd_barrier;
 }
 
 VulkanPresenter::VulkanPresenter() = default;
@@ -727,7 +727,7 @@ bool VulkanPresenter::read_back(std::vector<std::uint8_t>& out_pixels, VkExtent2
 }
 
 VkResult VulkanPresenter::present(std::uint32_t back_buffer_index, VkSemaphore wait_semaphore) {
-    std::lock_guard lock(mutex_);
+    std::unique_lock lock(mutex_);
     if (!initialized_ || back_buffer_index >= exposed_count_) return VK_ERROR_INITIALIZATION_FAILED;
 
     const VkImage current_img = images_[back_buffer_index];
@@ -736,12 +736,14 @@ VkResult VulkanPresenter::present(std::uint32_t back_buffer_index, VkSemaphore w
         capture_image_to_buffer(current_img);
     }
 
-    if (frame_callback_) {
-        frame_callback_(back_buffer_index, current_img);
-    }
+    auto callback_snapshot = frame_callback_;
 
     if (headless_) {
         ++presentation_count_;
+        lock.unlock();
+        if (callback_snapshot) {
+            callback_snapshot(back_buffer_index, current_img);
+        }
         return VK_SUCCESS;
     }
 
@@ -764,6 +766,10 @@ VkResult VulkanPresenter::present(std::uint32_t back_buffer_index, VkSemaphore w
     const VkResult res = fn_.queue_present(queue_, &pi);
     if (res == VK_SUCCESS || res == VK_SUBOPTIMAL_KHR) {
         ++presentation_count_;
+        lock.unlock();
+        if (callback_snapshot) {
+            callback_snapshot(back_buffer_index, current_img);
+        }
         return VK_SUCCESS;
     }
     return res;
