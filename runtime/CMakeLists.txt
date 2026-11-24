@@ -4837,3 +4837,16 @@ if(WIN32 AND MSVC)
     target_sources(${_target} PRIVATE $<TARGET_OBJECTS:gta6rt_crt_timed_wait>)
   endforeach()
 endif()
+find_package(Threads REQUIRED)
+add_executable(d3d12_x_stress_test
+  test/d3d12_x_stress_test.cpp
+  shims/d3d12_x.cpp
+  src/vulkan_device.cpp
+  src/vulkan_presenter.cpp
+)
+target_link_libraries(d3d12_x_stress_test PRIVATE Threads::Threads)
+if(NOT WIN32)
+  target_link_libraries(d3d12_x_stress_test PRIVATE dl)
+endif()
+add_test(NAME d3d12_x_stress COMMAND d3d12_x_stress_test)
+

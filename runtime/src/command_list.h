@@ -840,8 +840,7 @@ public:
                              std::span<const Rect> rects = {}) {
         if (!valid(target)) return false;
         if (flags & ~(clear_depth | clear_stencil)) return false;
-        if (!flags) return !closed_;
-        return append(ClearDepthStencil{target, flags, depth, stencil, {rects.begin(), rects.end()}});
+        if (!flags) return !closed_;        return append(ClearDepthStencil{target, flags, depth, stencil, {rects.begin(), rects.end()}});
     }
 
     // DiscardResource: a count of 0 discards nothing, as in D3D12. An explicit range must end before
