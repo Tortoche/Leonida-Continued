@@ -885,29 +885,46 @@ def _invocation(text, inputs, push_constants, memory, step=False, workgroup=None
             p = pointers[a[1]]
             if p[0] == "pc":
                 raise UnsupportedConstruct(f"{op} on a PushConstant")
-            if types.bits(a[0]) != 32:
-                raise UnsupportedConstruct(f"{op} on a non-32-bit integer")
+            b = types.bits(a[0])
+            if b not in (32, 64):
+                raise UnsupportedConstruct(f"{op} on a non-32/64-bit integer")
+            mask = (1 << b) - 1
             if p[0] == "psb":
-                old = memory.get(psb_word(p[1]), 0)
+                if b == 64:
+                    old = memory.get(psb_word(p[1]), 0) | (memory.get(psb_word(p[1] + 4), 0) << 32)
+                else:
+                    old = memory.get(psb_word(p[1]), 0)
             else:
                 old = deref(p)
-                if isinstance(old, bool) or not isinstance(old, int) or old > MASK:
-                    raise UnsupportedConstruct(f"{op} on a variable element that is not a 32-bit integer")
+                if isinstance(old, bool) or not isinstance(old, int) or old > mask:
+                    raise UnsupportedConstruct(f"{op} on a variable element that is not an integer")
             if op == "OpAtomicLoad":
                 values[res] = old
                 continue
             if op == "OpAtomicCompareExchange":
-                new = val(a[5]) if old == val(a[6]) & MASK else old
+                new = val(a[5]) if old == (val(a[6]) & mask) else old
             else:
-                v = val(a[4]) & MASK
-                new = {"OpAtomicIAdd": old + v, "OpAtomicISub": old - v, "OpAtomicUMin": min(old, v),
-                       "OpAtomicUMax": max(old, v), "OpAtomicSMin": old if _s32(old) <= _s32(v) else v,
-                       "OpAtomicSMax": old if _s32(old) >= _s32(v) else v, "OpAtomicAnd": old & v,
-                       "OpAtomicOr": old | v, "OpAtomicXor": old ^ v, "OpAtomicExchange": v}[op]
+                v = val(a[4]) & mask
+                if b == 64:
+                    def _s64(x):
+                        return x - (1 << 64) if (x >> 63) else x
+                    new = {"OpAtomicIAdd": old + v, "OpAtomicISub": old - v, "OpAtomicUMin": min(old, v),
+                           "OpAtomicUMax": max(old, v), "OpAtomicSMin": old if _s64(old) <= _s64(v) else v,
+                           "OpAtomicSMax": old if _s64(old) >= _s64(v) else v, "OpAtomicAnd": old & v,
+                           "OpAtomicOr": old | v, "OpAtomicXor": old ^ v, "OpAtomicExchange": v}[op]
+                else:
+                    new = {"OpAtomicIAdd": old + v, "OpAtomicISub": old - v, "OpAtomicUMin": min(old, v),
+                           "OpAtomicUMax": max(old, v), "OpAtomicSMin": old if _s32(old) <= _s32(v) else v,
+                           "OpAtomicSMax": old if _s32(old) >= _s32(v) else v, "OpAtomicAnd": old & v,
+                           "OpAtomicOr": old | v, "OpAtomicXor": old ^ v, "OpAtomicExchange": v}[op]
             if p[0] == "psb":
-                memory[p[1]] = new & MASK
+                if b == 64:
+                    memory[psb_word(p[1])] = new & MASK
+                    memory[psb_word(p[1] + 4)] = (new >> 32) & MASK
+                else:
+                    memory[psb_word(p[1])] = new & MASK
             else:
-                p[0][p[1]] = new & MASK
+                p[0][p[1]] = new & mask
             values[res] = old
         elif op == "OpAtomicStore":
             # <pointer> <scope> <semantics> <value>, no result: with invocations run one at a time, a plain store of
