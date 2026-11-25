@@ -1591,6 +1591,76 @@ void test_physical_pages_commit_on_touch(const PhysicalApi& api) {
     check(api.free_pages(count, pages.data()) == TRUE, "XMemFreePhysicalPages frees them");
 }
 
+void test_fault_batch_commit(const PhysicalApi& api) {
+    constexpr uint64_t kBatch = 64;
+    constexpr uint64_t kTotal = 128;
+    std::vector<uint64_t> pages(kTotal);
+    uint64_t got = kTotal;
+    check(api.allocate(0x380, &got, pages.data()) == TRUE && got == kTotal,
+          "batch commit test allocates 128 physical pages");
+    if (got != kTotal) return;
+
+    const auto is_committed = [](const void* addr) {
+        MEMORY_BASIC_INFORMATION info{};
+        return VirtualQuery(addr, &info, sizeof(info)) != 0 && info.Type == MEM_MAPPED && info.State == MEM_COMMIT;
+    };
+
+    auto* const window = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kTotal * kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE));
+    check(window != nullptr, "batch commit test reserves 128-page RW window");
+    if (window) {
+        check(api.map(window, kTotal, pages.data()) == window, "128 pages map into RW window");
+        static_cast<volatile uint32_t*>(static_cast<void*>(window + 5 * kPage64k))[0] = 0xba7c0005u;
+        check(is_committed(window) && is_committed(window + 5 * kPage64k) &&
+                  is_committed(window + (kBatch - 1) * kPage64k),
+              "touching page 5 commits aligned batch [0, 64)");
+        check(!is_committed(window + kBatch * kPage64k) && !is_committed(window + (kTotal - 1) * kPage64k),
+              "next batch [64, 128) stays uncommitted");
+
+        static_cast<volatile uint32_t*>(static_cast<void*>(window + 70 * kPage64k))[0] = 0xba7c0046u;
+        check(is_committed(window + kBatch * kPage64k) && is_committed(window + (kTotal - 1) * kPage64k),
+              "touching page 70 commits aligned batch [64, 128)");
+        check(read_u32(window + 5 * kPage64k, 0) == 0xba7c0005u &&
+                  read_u32(window + 70 * kPage64k, 0) == 0xba7c0046u,
+              "written values in both batches are preserved");
+        check(api.map(window, kTotal, nullptr) == window, "RW window unmaps");
+    }
+
+    // Partial view (< 64 pages) inside a 64-page window must clamp to the view end.
+    constexpr uint64_t kPartial = 10;
+    auto* const partial = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kBatch * kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READWRITE));
+    check(partial != nullptr, "batch commit test reserves 64-page window for partial view");
+    if (partial) {
+        check(api.map(partial, kPartial, pages.data()) == partial, "10-page partial view maps");
+        static_cast<volatile uint32_t*>(static_cast<void*>(partial + 3 * kPage64k))[0] = 0xba7c0003u;
+        check(is_committed(partial) && is_committed(partial + (kPartial - 1) * kPage64k),
+              "touching page 3 commits partial view [0, 10)");
+        check(!is_committed(partial + kPartial * kPage64k) && !is_committed(partial + (kBatch - 1) * kPage64k), "pages past the partial view end stay uncommitted");
+        check(api.map(partial, kPartial, nullptr) == partial, "partial view unmaps");
+    }
+
+    // PAGE_READONLY window must preserve read-only protection across all pages in the committed batch.
+    auto* const ro_window = static_cast<uint8_t*>(
+        api.virtual_alloc(nullptr, kBatch * kPage64k, MEM_RESERVE | kXmem64kPages, 0x21, PAGE_READONLY));
+    check(ro_window != nullptr, "batch commit test reserves 64-page PAGE_READONLY window");
+    if (ro_window) {
+        check(api.map(ro_window, kBatch, pages.data()) == ro_window, "64 pages map into PAGE_READONLY window");
+        const bool read_ok = !access_faults(
+            static_cast<volatile uint32_t*>(static_cast<void*>(ro_window + 10 * kPage64k)), false);
+        MEMORY_BASIC_INFORMATION info{};
+        const bool ro_prot = VirtualQuery(ro_window + 20 * kPage64k, &info, sizeof(info)) != 0 &&
+                             info.State == MEM_COMMIT && (info.Protect & 0xff) == PAGE_READONLY;
+        const bool write_faults =
+            access_faults(static_cast<volatile uint32_t*>(static_cast<void*>(ro_window + 20 * kPage64k)), true);
+        check(read_ok && ro_prot && write_faults,
+              "PAGE_READONLY protection is preserved on other pages inside a batch-committed view");
+        check(api.map(ro_window, kBatch, nullptr) == ro_window, "PAGE_READONLY window unmaps");
+    }
+
+    check(api.free_pages(kTotal, pages.data()) == TRUE, "batch commit test frees physical pages");
+}
+
 void test_commit_physical_pages(const PhysicalApi& api) {
     constexpr uint64_t kPages = 3;
     uint64_t pages[kPages]{};
@@ -2716,6 +2786,7 @@ int main(int argc, char** argv) {
         test_zero_pool_rollover(physical);
         test_foreign_section_writes(physical);
         test_failed_map_records(physical);
+        test_fault_batch_commit(physical);
         test_commit_physical_pages(physical);
         test_first_touch_during_remap(physical);
         test_long_run(physical);

@@ -1231,6 +1231,8 @@ bool map_zero_page(uintptr_t address, bool read_only) {
     return true;
 }
 
+constexpr uint64_t kFaultCommitBatchPages = 64;  // 4 MiB
+
 PageCommit commit_mapped_page(uintptr_t address, uintptr_t accessed, DWORD& protect) {
     auto it = g_views.upper_bound(address);
     if (it == g_views.begin()) return PageCommit::not_ours;
@@ -1246,10 +1248,26 @@ PageCommit commit_mapped_page(uintptr_t address, uintptr_t accessed, DWORD& prot
         protect = info.Protect;
         return PageCommit::committed_before;
     }
-    void* const backing = static_cast<uint8_t*>(it->second.section->scratch) + it->second.offset + within;
-    if (!VirtualAlloc(backing, kPhysicalPageSize, MEM_COMMIT, PAGE_READWRITE)) return PageCommit::failed;
-    leonida::geometry_writes::notify(address, address + kPhysicalPageSize, leonida::geometry_writes::Event::mapping);
-    leonida::title_memory_map::changed(address, address + kPhysicalPageSize);
+    const uint64_t page_idx = within / kPhysicalPageSize;
+    const uint64_t batch_begin_idx = page_idx & ~(kFaultCommitBatchPages - 1);
+    const uint64_t batch_end_idx = (std::min)(it->second.count, batch_begin_idx + kFaultCommitBatchPages);
+    const uint64_t batch_pages = batch_end_idx - batch_begin_idx;
+    const uintptr_t batch_va = it->first + batch_begin_idx * kPhysicalPageSize;
+    const SIZE_T batch_bytes = static_cast<SIZE_T>(batch_pages * kPhysicalPageSize);
+    void* const batch_backing =
+        static_cast<uint8_t*>(it->second.section->scratch) + it->second.offset + batch_begin_idx * kPhysicalPageSize;
+
+    uintptr_t notify_va = batch_va;
+    SIZE_T notify_bytes = batch_bytes;
+    if (!VirtualAlloc(batch_backing, batch_bytes, MEM_COMMIT, PAGE_READWRITE)) {
+        if (batch_pages <= 1) return PageCommit::failed;
+        void* const backing = static_cast<uint8_t*>(it->second.section->scratch) + it->second.offset + within;
+        if (!VirtualAlloc(backing, kPhysicalPageSize, MEM_COMMIT, PAGE_READWRITE)) return PageCommit::failed;
+        notify_va = address;
+        notify_bytes = kPhysicalPageSize;
+    }
+    leonida::geometry_writes::notify(notify_va, notify_va + notify_bytes, leonida::geometry_writes::Event::mapping);
+    leonida::title_memory_map::changed(notify_va, notify_va + notify_bytes);
     return PageCommit::committed_now;
 }
 
