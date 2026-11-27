@@ -132,6 +132,19 @@ void fixed_cases() {
     check(bound.longest() == 0x40 && at(bound, 0x20040) == 0, "re-registering replaces the size");
     bound.erase(0x20000, 2);
     check(bound.longest() == 0 && bound.size() == 0, "an empty index has no bound");
+
+    // High-VA range near UINT64_MAX without wrapping past 2^64, plus zero-VA erase no-op.
+    Index high;
+    high.erase(0, 1);
+    check(high.size() == 0, "erasing null VA on empty index is a no-op");
+    constexpr std::uint64_t high_start = ~std::uint64_t(0) - 0xfff;
+    high.insert(high_start, 0x1000, 77);
+    check(at(high, high_start) == 77 && at(high, ~std::uint64_t(0)) == 77,
+          "high-VA range reaching UINT64_MAX is indexed");
+    check(high.covers(high_start, 0x1000) && !high.covers(high_start, 0x1001),
+          "covers() at UINT64_MAX boundary does not overflow");
+    high.erase(high_start, 77);
+    check(high.size() == 0 && at(high, high_start) == 0, "high-VA range erases cleanly");
 }
 
 void allocation_failures() {
