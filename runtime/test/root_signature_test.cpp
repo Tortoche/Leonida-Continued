@@ -615,6 +615,24 @@ int main() {
         RootSignature many;
         many.params.assign(65, table());
         check(!pack_stage(many, Stage::Compute).ok, "pack_stage: more than 64 parameters rejected");
+
+        // Empty root signature packs cleanly in both pack() and pack_stage().
+        RootSignature empty_sig;
+        const PackResult empty_pack = pack(empty_sig);
+        check(empty_pack.ok && empty_pack.dword_count == 0 && empty_pack.d3d12_cost == 0,
+              "pack: empty root signature succeeds with 0 dwords");
+        const StagePackResult empty_compute = pack_stage(empty_sig, Stage::Compute);
+        check(empty_compute.ok && empty_compute.end_sgpr == 4 && empty_compute.spill_dwords == 0 &&
+                  empty_compute.d3d12_cost == 0,
+              "pack_stage: empty compute root signature uses no SGPRs");
+
+        // Exact 64-dword D3D12 cost boundary is accepted by pack_stage (spilling whole when first param > 28 dwords).
+        RootSignature exact_64;
+        exact_64.params = {consts(32), consts(32)};
+        const StagePackResult exact_64_r = pack_stage(exact_64, Stage::Compute);
+        check(exact_64_r.ok && exact_64_r.d3d12_cost == 64 && exact_64_r.end_sgpr == 4 &&
+                  exact_64_r.spill_dwords == 64,
+              "pack_stage: exact 64-dword D3D12 cost accepted");
     }
 
     if (g_failures != 0) std::printf("%d FAILURES\n", g_failures);
