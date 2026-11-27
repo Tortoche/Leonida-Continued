@@ -205,6 +205,238 @@ def _finite_matrix(m) -> bool:
     return len(m) == 16 and all(isinstance(v, (int, float)) and math.isfinite(v) for v in m)
 
 
+def compute_skinning_matrices(
+    joints: JointSet,
+    world_poses: list[list[float]] | None = None,
+) -> list[list[float]]:
+    """Compute 4x4 column-major skinning matrices (M_j = W_j * B_j^-1) for all joints.
+
+    In rest pose (world_poses is None), each joint's world pose is its bind pose,
+    so each skinning matrix is the 4x4 identity matrix. When world_poses is
+    supplied, it must provide one 16-float column-major affine matrix per joint.
+    """
+    if world_poses is None:
+        return [_identity() for _ in range(joints.count)]
+    if len(world_poses) != joints.count:
+        raise SkinError(
+            f"world_poses length ({len(world_poses)}) does not match joints count ({joints.count})"
+        )
+    out = []
+    for i in range(joints.count):
+        w = world_poses[i]
+        if not _finite_matrix(w):
+            raise SkinError(f"joint {joints.names[i]!r} has a non-finite world pose matrix")
+        out.append(mat_mul(w, joints.inverse_bind(i)))
+    return out
+
+
+def forward_kinematics(
+    joints: JointSet,
+    local_matrices: list[list[float]],
+) -> list[list[float]]:
+    """Compute world matrices from local matrices along the skeleton hierarchy.
+
+    For root joints (parent is None), world matrix equals local matrix. For children,
+    world matrix equals parent_world * local_matrix.
+    """
+    if len(local_matrices) != joints.count:
+        raise SkinError(
+            f"local_matrices length ({len(local_matrices)}) does not match joints count ({joints.count})"
+        )
+    world: list[list[float] | None] = [None] * joints.count
+    for i in range(joints.count):
+        local = local_matrices[i]
+        if not _finite_matrix(local):
+            raise SkinError(f"joint {joints.names[i]!r} has a non-finite local matrix")
+        parent = joints.parents[i]
+        if parent is not None and (not isinstance(parent, int) or not (0 <= parent < joints.count)):
+            raise SkinError(f"joint {joints.names[i]!r} has invalid parent index {parent}")
+        if parent is None:
+            world[i] = list(local)
+        else:
+            if world[parent] is None:
+                stack = []
+                curr: int | None = i
+                visited: set[int] = set()
+                while curr is not None and world[curr] is None:
+                    if not isinstance(curr, int) or not (0 <= curr < joints.count):
+                        raise SkinError(f"joint parent index {curr} out of range [0, {joints.count})")
+                    if curr in visited:
+                        raise SkinError(
+                            f"cycle detected in joint parent hierarchy at joint {curr} ({joints.names[curr]!r})"
+                        )
+                    visited.add(curr)
+                    stack.append(curr)
+                    curr = joints.parents[curr]
+                while stack:
+                    node = stack.pop()
+                    p = joints.parents[node]
+                    if p is None:
+                        world[node] = list(local_matrices[node])
+                    else:
+                        parent_m = world[p]
+                        assert parent_m is not None
+                        world[node] = mat_mul(parent_m, local_matrices[node])
+            else:
+                parent_m = world[parent]
+                assert parent_m is not None
+                world[i] = mat_mul(parent_m, local)
+    if any(w is None for w in world):
+        raise SkinError("failed to compute world transform for all joints")
+    return [w for w in world if w is not None]
+
+
+def apply_skinning(
+    positions: list[tuple[float, float, float]],
+    joints_0: bytes,
+    joints_1: bytes,
+    weights_0: bytes,
+    weights_1: bytes,
+    skinning_matrices: list[list[float]],
+    normals: list[tuple[float, float, float]] | None = None,
+) -> tuple[list[tuple[float, float, float]], list[tuple[float, float, float]] | None]:
+    """Apply 8-influence linear blend skinning to vertex positions and optional normals.
+
+    Uses skinning_matrices (column-major 4x4) and unpacked 4xUNSIGNED_SHORT joints and
+    4xFLOAT weights from streams 0 and 1. Falls back to pure Python stdlib when numpy
+    is absent, producing identical values within float precision.
+    """
+    vertex_count = len(positions)
+    if not vertex_count:
+        return [], ([] if normals is not None else None)
+    if len(joints_0) < vertex_count * 8 or len(joints_1) < vertex_count * 8:
+        raise SkinError("joints stream buffer shorter than vertex count")
+    if len(weights_0) < vertex_count * 16 or len(weights_1) < vertex_count * 16:
+        raise SkinError("weights stream buffer shorter than vertex count")
+    if normals is not None and len(normals) != vertex_count:
+        raise SkinError(f"normals count ({len(normals)}) != positions count ({vertex_count})")
+
+    joint_count = len(skinning_matrices)
+
+    if _np is not None:
+        try:
+            mats = _np.array(skinning_matrices, dtype=_np.float32).reshape(joint_count, 4, 4)
+            mats_rm = mats.transpose(0, 2, 1)
+
+            j0 = _np.frombuffer(joints_0, dtype="<u2", count=vertex_count * 4).reshape(vertex_count, 4)
+            j1 = _np.frombuffer(joints_1, dtype="<u2", count=vertex_count * 4).reshape(vertex_count, 4)
+            j_all = _np.concatenate([j0, j1], axis=1)
+
+            w0 = _np.frombuffer(weights_0, dtype="<f4", count=vertex_count * 4).reshape(vertex_count, 4)
+            w1 = _np.frombuffer(weights_1, dtype="<f4", count=vertex_count * 4).reshape(vertex_count, 4)
+            w_all = _np.concatenate([w0, w1], axis=1)
+
+            if _np.any(j_all >= joint_count):
+                raise SkinError("joint index out of bounds for skinning matrices")
+
+            blended_M = _np.sum(w_all[:, :, None, None] * mats_rm[j_all], axis=1)
+
+            pos_arr = _np.array(positions, dtype=_np.float32)
+            pos_homo = _np.concatenate([pos_arr, _np.ones((vertex_count, 1), dtype=_np.float32)], axis=1)
+            skinned_p = _np.einsum("bij,bj->bi", blended_M, pos_homo)[:, :3]
+            out_positions = [tuple(row) for row in skinned_p.tolist()]
+
+            out_normals = None
+            if normals is not None:
+                norm_arr = _np.array(normals, dtype=_np.float32)
+                skinned_n = _np.einsum("bij,bj->bi", blended_M[:, :3, :3], norm_arr)
+                norms = _np.linalg.norm(skinned_n, axis=1, keepdims=True)
+                norms[_np.abs(norms) < 1e-12] = 1.0
+                skinned_n /= norms
+                out_normals = [tuple(row) for row in skinned_n.tolist()]
+
+            return out_positions, out_normals
+        except SkinError:
+            raise
+        except Exception:
+            pass
+
+    out_positions = []
+    out_normals = [] if normals is not None else None
+
+    for v in range(vertex_count):
+        j_row = struct.unpack_from("<4H", joints_0, v * 8) + struct.unpack_from("<4H", joints_1, v * 8)
+        w_row = struct.unpack_from("<4f", weights_0, v * 16) + struct.unpack_from("<4f", weights_1, v * 16)
+
+        px, py, pz = positions[v]
+        res_x = res_y = res_z = 0.0
+
+        for k in range(8):
+            w = w_row[k]
+            if abs(w) <= 1e-9:
+                continue
+            j = j_row[k]
+            if j >= joint_count:
+                raise SkinError(f"joint index {j} out of bounds ({joint_count})")
+            m = skinning_matrices[j]
+            tx = m[0] * px + m[4] * py + m[8] * pz + m[12]
+            ty = m[1] * px + m[5] * py + m[9] * pz + m[13]
+            tz = m[2] * px + m[6] * py + m[10] * pz + m[14]
+            res_x += w * tx
+            res_y += w * ty
+            res_z += w * tz
+
+        out_positions.append((res_x, res_y, res_z))
+
+        if normals is not None:
+            nx, ny, nz = normals[v]
+            rnx = rny = rnz = 0.0
+            for k in range(8):
+                w = w_row[k]
+                if abs(w) <= 1e-9:
+                    continue
+                j = j_row[k]
+                m = skinning_matrices[j]
+                rnx += w * (m[0] * nx + m[4] * ny + m[8] * nz)
+                rny += w * (m[1] * nx + m[5] * ny + m[9] * nz)
+                rnz += w * (m[2] * nx + m[6] * ny + m[10] * nz)
+            length = math.sqrt(rnx * rnx + rny * rny + rnz * rnz)
+            if length > 1e-12:
+                inv_l = 1.0 / length
+                out_normals.append((rnx * inv_l, rny * inv_l, rnz * inv_l))
+            else:
+                out_normals.append((rnx, rny, rnz))
+
+    return out_positions, out_normals
+
+
+def assemble_skeleton_hierarchy(
+    joints: JointSet,
+    mesh_node_index: int,
+    skin_name: str = "ped_skeleton",
+    ibm_accessor: int = 0,
+) -> tuple[list[dict], list[int], dict]:
+    """Assemble glTF skeleton nodes, scene root list, and skin definition.
+
+    Handles single and multiple root bones without orphaning detached roots.
+    """
+    nodes = []
+    for index, name in enumerate(joints.names):
+        node = {"name": name}
+        local = joints.local_matrix(index)
+        if not _is_identity(local):
+            node["matrix"] = [round(v, 9) for v in local]
+        nodes.append(node)
+
+    nodes.append({"name": "skinned_export", "mesh": 0, "skin": 0})
+    for index, parent in enumerate(joints.parents):
+        if parent is not None:
+            nodes[parent].setdefault("children", []).append(index)
+
+    roots = [i for i, p in enumerate(joints.parents) if p is None]
+    if not roots:
+        roots = [joints.root]
+    scene_nodes = list(roots) + [mesh_node_index]
+
+    skin = {
+        "name": skin_name,
+        "joints": list(range(joints.count)),
+        "skeleton": joints.root,
+        "inverseBindMatrices": ibm_accessor,
+    }
+    return nodes, scene_nodes, skin
+
+
 # ------------------------------------------------------------------------ files
 def _load_json(path: str) -> dict:
     # An interrupted export leaves an empty or cut-off model.json: report it like any other bad input (BUILD-1031).
@@ -407,8 +639,8 @@ class JointSet:
         for index, bone in enumerate(ped_skeleton):
             bind = bind_to_gltf(bone["bind_matrix"])
             parent = bone.get("parent")
-            if not isinstance(parent, int) or not 0 <= parent < len(ped_skeleton):
-                parent = None if index == self.root else self.root
+            if parent is not None and (not isinstance(parent, int) or not 0 <= parent < len(ped_skeleton)):
+                parent = self.root
             self.names.append(bone["name"])
             self.binds.append(bind)
             self.parents.append(parent)
@@ -955,19 +1187,9 @@ def build_skinned_glb(skeleton_path: str, component_paths: list[str], *,
                            for i in range(joints.count))
     ibm_accessor = builder.accessor(ibm_payload, COMPONENT_FLOAT, "MAT4", joints.count, None)
     mesh_node = len(joints.names)
-    nodes = []
-    for index, name in enumerate(joints.names):
-        node = {"name": name}
-        local = joints.local_matrix(index)
-        if not _is_identity(local):
-            node["matrix"] = [round(v, 9) for v in local]
-        nodes.append(node)
-    nodes.append({"name": "skinned_export", "mesh": 0, "skin": 0})
-    for index, parent in enumerate(joints.parents):
-        if parent is not None:
-            nodes[parent].setdefault("children", []).append(index)
-
-    scene_nodes = [joints.root, mesh_node]
+    nodes, scene_nodes, skin = assemble_skeleton_hierarchy(
+        joints, mesh_node, skin_name="ped_skeleton", ibm_accessor=ibm_accessor
+    )
     gltf = {
         "asset": {"version": "2.0", "generator": generator},
         "scene": 0,
@@ -978,12 +1200,7 @@ def build_skinned_glb(skeleton_path: str, component_paths: list[str], *,
         "accessors": builder.accessors,
         "bufferViews": builder.views,
         "buffers": [{"byteLength": 0}],
-        "skins": [{
-            "name": "ped_skeleton",
-            "joints": list(range(joints.count)),
-            "skeleton": joints.root,
-            "inverseBindMatrices": ibm_accessor,
-        }],
+        "skins": [skin],
     }
     builder.bin.extend(b"\x00" * ((-len(builder.bin)) % 4))
     gltf["buffers"][0]["byteLength"] = len(builder.bin)
