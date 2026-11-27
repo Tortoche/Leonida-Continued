@@ -296,7 +296,7 @@ def out_problem(path):
         return "cannot create its folder: %s" % e
     if not os.access(parent, os.W_OK):
         return "its folder is not writable: %s" % parent
-    if os.path.exists(path) and not os.access(path, os.W_OK):
+    if os.path.exists(path) and (not os.access(path, os.W_OK) or (os.stat(path).st_mode & 0o222) == 0):
         return "the existing summary is read-only"
     return None
 
