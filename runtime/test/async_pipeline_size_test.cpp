@@ -18,6 +18,7 @@ int failures = 0;
 } while (0)
 
 using leonida::async_pipelines::asynchronous;
+using leonida::async_pipelines::effective_warmup_live_max_bytes;
 using leonida::async_pipelines::parse_min_bytes;
 
 void parsing() {
@@ -63,11 +64,40 @@ void decision() {
     CHECK(asynchronous(true, UINT64_MAX, UINT64_MAX));
 }
 
+void warmup_live_max() {
+    constexpr std::uint64_t mib = 1u << 20;
+    bool valid = false;
+
+    // Unset or empty: follows async_min_bytes only when async builds are on.
+    CHECK(effective_warmup_live_max_bytes(nullptr, false, 0, &valid) == 0 && valid);
+    CHECK(effective_warmup_live_max_bytes(nullptr, false, 2 * mib, &valid) == 0 && valid);
+    CHECK(effective_warmup_live_max_bytes(nullptr, true, 0, &valid) == 0 && valid);
+    CHECK(effective_warmup_live_max_bytes(nullptr, true, 2 * mib, &valid) == 2 * mib && valid);
+    CHECK(effective_warmup_live_max_bytes("", true, 2 * mib, &valid) == 2 * mib && valid);
+
+    // Explicit "0" disables the limit even when async_min_bytes > 0.
+    CHECK(effective_warmup_live_max_bytes("0", true, 2 * mib, &valid) == 0 && valid);
+    CHECK(effective_warmup_live_max_bytes("0", false, 0, &valid) == 0 && valid);
+
+    // Explicit <n> overrides async_min_bytes (both smaller and larger, and with async off).
+    CHECK(effective_warmup_live_max_bytes("131072", true, 2 * mib, &valid) == 131072 && valid);
+    CHECK(effective_warmup_live_max_bytes("4194304", true, 2 * mib, &valid) == 4 * mib && valid);
+    CHECK(effective_warmup_live_max_bytes("131072", false, 0, &valid) == 131072 && valid);
+    CHECK(effective_warmup_live_max_bytes("131072", true, 0) == 131072);  // `valid` is optional
+
+    // Invalid explicit text is reported and falls back to the async_min_bytes default.
+    valid = true;
+    CHECK(effective_warmup_live_max_bytes("abc", true, 2 * mib, &valid) == 2 * mib && !valid);
+    valid = true;
+    CHECK(effective_warmup_live_max_bytes("-1", false, 2 * mib, &valid) == 0 && !valid);
+}
+
 }  // namespace
 
 int main() {
     parsing();
     decision();
+    warmup_live_max();
     if (failures) {
         std::fprintf(stderr, "async_pipeline_size_test: %d failure(s)\n", failures);
         return 1;

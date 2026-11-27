@@ -37,4 +37,22 @@ inline bool asynchronous(bool async_on, std::uint64_t min_bytes, std::uint64_t s
     return async_on && (min_bytes == 0 || spirv_bytes >= min_bytes);
 }
 
+// Effective LEONIDA_COMPUTE_WARMUP_LIVE_MAX_BYTES threshold:
+// - When `warmup_live_max_text` is non-empty and valid (including "0"), that explicit value is used.
+// - Otherwise (unset, empty, or invalid), when asynchronous builds are on with a non-zero `async_min_bytes`,
+//   defaults to `async_min_bytes` so large compute warm-ups wait for quiet while the title submits; else 0.
+inline std::uint64_t effective_warmup_live_max_bytes(const char* warmup_live_max_text,
+                                                     bool async_on,
+                                                     std::uint64_t async_min_bytes,
+                                                     bool* valid = nullptr) {
+    if (valid) *valid = true;
+    if (warmup_live_max_text && *warmup_live_max_text) {
+        bool parsed_ok = true;
+        const std::uint64_t explicit_limit = parse_min_bytes(warmup_live_max_text, &parsed_ok);
+        if (valid) *valid = parsed_ok;
+        if (parsed_ok) return explicit_limit;
+    }
+    return async_on ? async_min_bytes : 0;
+}
+
 }  // namespace leonida::async_pipelines
