@@ -46,6 +46,8 @@ def build_tile(
     links=None,
     link_indices=None,
     two_streams=False,
+    custom_verts=None,
+    custom_vidx=None,
     corrupt_edge_oob=False,
     corrupt_edge_sector=False,
     corrupt_pool_vert_sum=False,
@@ -61,6 +63,8 @@ def build_tile(
     has_links = bool(flags & 2)
     n_polys = len(poly_sizes)
     pool = sum(poly_sizes)
+    if custom_verts is not None:
+        n_verts = len(custom_verts)
 
     if not has_links:
         poly_link_counts = (0,) * n_polys
