@@ -2897,8 +2897,9 @@ submitting thread; at the maintainers' decision it was replaced by this one when
   each) against 25 such builds a dispatch asked for (measured with a 128 KiB limit). With
   `LEONIDA_COMPUTE_WARMUP_LIVE_MAX_BYTES=<n>` a warm-up of a module over n bytes of SPIR-V is not started while the
   title submits (a submission in the last second, `src/pipeline_wait.h`); the pipeline is built at its first use
-  instead. Opt-in: unset or 0, every warm-up runs, as on `main`, and `LargeModuleGate` (#1889) orders them behind a
-  submission's compiles. Smaller warm-ups, and every warm-up before the first submission, run as before.
+  instead. Unset, it defaults to `LEONIDA_ASYNC_MIN_BYTES` when `LEONIDA_ASYNC_PIPELINES=1` and `LEONIDA_ASYNC_MIN_BYTES > 0`;
+  explicit `0` (or unset without a non-zero async threshold) runs every warm-up, ordered behind a submission's compiles
+  by `LargeModuleGate` (#1889). Smaller warm-ups, and every warm-up before the first submission, run as before.
 
 **Open:** whether the game uses `D3D12_PIPELINE_STATE_STREAM_DESC` for mesh/RT and which subobject types appear.
 The trace will enumerate them.

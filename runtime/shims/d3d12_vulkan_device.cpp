@@ -12659,18 +12659,21 @@ public:
     }
 
 private:
-    // LEONIDA_COMPUTE_WARMUP_LIVE_MAX_BYTES=<n> (opt-in; unset or 0: no limit, the warm-up builds every module as on
-    // main): a warm-up of a module over n bytes of SPIR-V is not started while the title submits (a submission in the
-    // last second); it is left to the pipeline's first use. A create holds the compile gate (SubmitMutex::CompileTurn)
-    // for its whole length and every submission waits behind it; on NVIDIA 630.20 the modules over 640 KiB take 4-25 s
-    // each. Measured in a native boot past the story load (with 131072): 694 warm-ups of modules over 128 KiB against
-    // 25 such builds a dispatch asked for, and one run's submissions waited 140 s in all at the gate behind warm-ups.
+    // LEONIDA_COMPUTE_WARMUP_LIVE_MAX_BYTES=<n> (0: no limit; unset: defaults to LEONIDA_ASYNC_MIN_BYTES when
+    // LEONIDA_ASYNC_PIPELINES=1 and LEONIDA_ASYNC_MIN_BYTES > 0, else 0): a warm-up of a module over n bytes of SPIR-V
+    // is not started while the title submits (a submission in the last second); it is left to the pipeline's first
+    // use. A create holds the compile gate (SubmitMutex::CompileTurn) for its whole length and every submission waits
+    // behind it; on NVIDIA 630.20 the modules over 640 KiB take 4-25 s each. Measured in a native boot past the story
+    // load (with 131072): 694 warm-ups of modules over 128 KiB against 25 such builds a dispatch asked for, and one
+    // run's submissions waited 140 s in all at the gate behind warm-ups.
     static bool warmup_waits_for_quiet(std::size_t bytes) {
         static const std::size_t limit = [] {
             char text[32]{};
             const DWORD n = GetEnvironmentVariableA("LEONIDA_COMPUTE_WARMUP_LIVE_MAX_BYTES", text, sizeof(text));
-            return (n > 0 && n < sizeof(text)) ? static_cast<std::size_t>(std::strtoull(text, nullptr, 10))
-                                               : std::size_t{0};
+            const char* env_text = (n > 0 && n < sizeof(text)) ? text : nullptr;
+            const std::uint64_t effective = leonida::async_pipelines::effective_warmup_live_max_bytes(
+                env_text, async_replay_compile(), async_min_bytes());
+            return effective > SIZE_MAX ? SIZE_MAX : static_cast<std::size_t>(effective);
         }();
         if (!limit || bytes <= limit || !leonida::pipeline_wait::title_submitting()) return false;
         if (compile_helper::wanted(bytes)) return false;  // the helper compiles it, in its own process
