@@ -178,6 +178,167 @@ def quat_rotate(q, v):
     return (vx + w * tx + y * tz - z * ty, vy + w * ty + z * tx - x * tz, vz + w * tz + x * ty - y * tx)
 
 
+def quat_to_mat4(rotation, translation, scale=None):
+    """Convert quaternion rotation (x,y,z,w), translation (x,y,z), and optional scale to a 4x4 column-major matrix."""
+    qx, qy, qz, qw = rotation
+    tx, ty, tz = translation
+    sx, sy, sz = (1.0, 1.0, 1.0) if scale is None else scale
+
+    x2, y2, z2 = qx + qx, qy + qy, qz + qz
+    xx, xy, xz = qx * x2, qx * y2, qx * z2
+    yy, yz, zz = qy * y2, qy * z2, qz * z2
+    wx, wy, wz = qw * x2, qw * y2, qw * z2
+
+    return [
+        (1.0 - (yy + zz)) * sx, (xy + wz) * sx, (xz - wy) * sx, 0.0,
+        (xy - wz) * sy, (1.0 - (xx + zz)) * sy, (yz + wx) * sy, 0.0,
+        (xz + wy) * sz, (yz - wx) * sz, (1.0 - (xx + yy)) * sz, 0.0,
+        tx, ty, tz, 1.0,
+    ]
+
+
+def mat4_mul(a, b):
+    """Column-major 4x4 matrix multiplication a * b."""
+    out = [0.0] * 16
+    for col in range(4):
+        for row in range(4):
+            out[col * 4 + row] = sum(a[k * 4 + row] * b[col * 4 + k] for k in range(4))
+    return out
+
+
+def invert_affine_mat4(m):
+    """Invert a 4x4 column-major affine matrix."""
+    a = lambda r, c: m[c * 4 + r]
+    det = (a(0, 0) * (a(1, 1) * a(2, 2) - a(1, 2) * a(2, 1))
+           - a(0, 1) * (a(1, 0) * a(2, 2) - a(1, 2) * a(2, 0))
+           + a(0, 2) * (a(1, 0) * a(2, 1) - a(1, 1) * a(2, 0)))
+    if not math.isfinite(det) or abs(det) < 1e-12:
+        raise ValueError("singular or non-finite affine matrix")
+    k = 1.0 / det
+    c00 = (a(1, 1) * a(2, 2) - a(1, 2) * a(2, 1)) * k
+    c10 = (a(0, 2) * a(2, 1) - a(0, 1) * a(2, 2)) * k
+    c20 = (a(0, 1) * a(1, 2) - a(0, 2) * a(1, 1)) * k
+    c01 = (a(1, 2) * a(2, 0) - a(1, 0) * a(2, 2)) * k
+    c11 = (a(0, 0) * a(2, 2) - a(0, 2) * a(2, 0)) * k
+    c21 = (a(0, 2) * a(1, 0) - a(0, 0) * a(1, 2)) * k
+    c02 = (a(1, 0) * a(2, 1) - a(1, 1) * a(2, 0)) * k
+    c12 = (a(0, 1) * a(2, 0) - a(0, 0) * a(2, 1)) * k
+    c22 = (a(0, 0) * a(1, 1) - a(0, 1) * a(1, 0)) * k
+    tx, ty, tz = a(0, 3), a(1, 3), a(2, 3)
+    return [
+        c00, c01, c02, 0.0,
+        c10, c11, c12, 0.0,
+        c20, c21, c22, 0.0,
+        -(c00 * tx + c10 * ty + c20 * tz),
+        -(c01 * tx + c11 * ty + c21 * tz),
+        -(c02 * tx + c12 * ty + c22 * tz),
+        1.0,
+    ]
+
+
+def _sample_channel(keys, time, default):
+    """Sample animation channel keyframes at given time."""
+    if not keys:
+        return default
+    if time <= keys[0][0]:
+        return keys[0][1]
+    if time >= keys[-1][0]:
+        return keys[-1][1]
+    for (t0, v0), (t1, v1) in zip(keys, keys[1:]):
+        if t0 <= time <= t1:
+            span = t1 - t0
+            factor = (time - t0) / span if span > 1e-9 else 0.0
+            return tuple(a + factor * (b - a) for a, b in zip(v0, v1))
+    return keys[-1][1]
+
+
+def compute_forward_kinematics(joints, pose_channels=None, time=0.0):
+    """Compute world-space (rotation_quat, translation) for all joints.
+
+    If pose_channels is provided (maps (joint_idx, 'rotation'|'translation') to [(time, val)]),
+    evaluates sampled pose at `time`. Otherwise uses default rest transforms.
+    """
+    world = []
+    for i, j in enumerate(joints):
+        q = j["rotation"]
+        t = j["translation"]
+        if pose_channels:
+            if (i, "rotation") in pose_channels:
+                keys = pose_channels[(i, "rotation")]
+                q = _sample_channel(keys, time, default=q)
+            if (i, "translation") in pose_channels:
+                keys = pose_channels[(i, "translation")]
+                t = _sample_channel(keys, time, default=t)
+        parent = j["parent"]
+        if parent is None:
+            world.append((q, t))
+        else:
+            pq, pt = world[parent]
+            world.append((quat_mul(pq, q), tuple(a + b for a, b in zip(pt, quat_rotate(pq, t)))))
+    return world
+
+
+def compute_skinning_matrices(joints, world_transforms=None):
+    """Compute 4x4 skinning matrices (World * InverseBind) for all joints."""
+    if world_transforms is None:
+        world_transforms = compute_forward_kinematics(joints)
+    matrices = []
+    for j, (wq, wt) in zip(joints, world_transforms):
+        scale = j.get("scale", (1.0, 1.0, 1.0))
+        world_mat = quat_to_mat4(wq, wt, scale)
+        matrices.append(mat4_mul(world_mat, j["inverse_bind"]))
+    return matrices
+
+
+def skin_mesh_positions(positions, joint_indices, weights, skinning_matrices):
+    """Apply linear blend skinning to a list of positions."""
+    skinned = []
+    joint_count = len(skinning_matrices)
+    for p, j_row, w_row in zip(positions, joint_indices, weights):
+        px, py, pz = p
+        rx = ry = rz = 0.0
+        for j, w in zip(j_row, w_row):
+            if abs(w) <= 1e-9:
+                continue
+            require(j < joint_count, f"joint index {j} exceeds matrix count {joint_count}")
+            m = skinning_matrices[j]
+            rx += w * (m[0] * px + m[4] * py + m[8] * pz + m[12])
+            ry += w * (m[1] * px + m[5] * py + m[9] * pz + m[13])
+            rz += w * (m[2] * px + m[6] * py + m[10] * pz + m[14])
+        skinned.append((rx, ry, rz))
+    return skinned
+
+
+def assemble_skeleton_nodes(joints, *, root_motion=True, first_joint=None):
+    """Assemble glTF skeleton node hierarchy and skin dictionary."""
+    nodes = [{"name": "rage_z_up", "rotation": Z_UP_TO_Y_UP, "children": []}]
+    holder = nodes[0]
+    mover = None
+    if root_motion:
+        mover = len(nodes)
+        nodes.append({"name": "mover", "children": []})
+        holder["children"].append(mover)
+        holder = nodes[mover]
+    fj = len(nodes) if first_joint is None else first_joint
+    for i, j in enumerate(joints):
+        node = {"name": j["name"] or f"bone_0x{j['hash']:08x}"}
+        node["rotation"] = [round(v, 7) for v in j["rotation"]]
+        node["translation"] = [round(v, 7) for v in j["translation"]]
+        if any(abs(s - 1.0) > 1e-6 for s in j["scale"]):
+            node["scale"] = [round(v, 7) for v in j["scale"]]
+        nodes.append(node)
+    for i, j in enumerate(joints):
+        if j["parent"] is None:
+            holder["children"].append(fj + i)
+        else:
+            nodes[fj + j["parent"]].setdefault("children", []).append(fj + i)
+    roots = [fj + i for i, j in enumerate(joints) if j["parent"] is None]
+    skin = {"joints": list(range(fj, fj + len(joints)))}
+    if len(roots) == 1:
+        skin["skeleton"] = roots[0]
+    return nodes, skin, fj, mover
+
+
 def read_skeleton(sys, drawable):
     """-> list of joints {hash, name, parent, rotation, translation, scale, inverse_bind (16 floats)}.
 
@@ -525,33 +686,10 @@ def _floats(values):
 def build(joints, meshes, clips, *, root_motion=True, generator="Leonida anim_glb"):
     """glTF JSON + binary chunk for the skeleton, the bound meshes and the clip channels -> GLB bytes."""
     buf, views, accessors = bytearray(), [], []
-    nodes = [{"name": "rage_z_up", "rotation": Z_UP_TO_Y_UP, "children": []}]
-    holder = nodes[0]
-    mover = None
-    if root_motion:
-        mover = len(nodes)
-        nodes.append({"name": "mover", "children": []})
-        holder["children"].append(mover)
-        holder = nodes[mover]
-    first_joint = len(nodes)
-    for i, j in enumerate(joints):
-        node = {"name": j["name"] or f"bone_0x{j['hash']:08x}"}
-        node["rotation"] = [round(v, 7) for v in j["rotation"]]
-        node["translation"] = [round(v, 7) for v in j["translation"]]
-        if any(abs(s - 1.0) > 1e-6 for s in j["scale"]):
-            node["scale"] = [round(v, 7) for v in j["scale"]]
-        nodes.append(node)
-    for i, j in enumerate(joints):
-        if j["parent"] is None:
-            holder["children"].append(first_joint + i)
-        else:
-            nodes[first_joint + j["parent"]].setdefault("children", []).append(first_joint + i)
+    nodes, skin, first_joint, mover = assemble_skeleton_nodes(joints, root_motion=root_motion)
     ibm_view = _view(buf, views, _floats([v for j in joints for v in j["inverse_bind"]]))
     ibm = _accessor(accessors, ibm_view, COMPONENT_FLOAT, len(joints), "MAT4")
-    skin = {"joints": list(range(first_joint, first_joint + len(joints))), "inverseBindMatrices": ibm}
-    roots = [first_joint + i for i, j in enumerate(joints) if j["parent"] is None]
-    if len(roots) == 1:
-        skin["skeleton"] = roots[0]
+    skin["inverseBindMatrices"] = ibm
     gltf_meshes, scene_nodes = [], [0]
     for mesh in meshes:
         packed = glb_writer.pack_primitive({"positions": mesh["positions"], "indices": mesh["indices"]})
