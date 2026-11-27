@@ -287,7 +287,7 @@ Current limits, by design:
   overlay; each queue reads file or memory ranges into memory in order on its own worker thread, inflating zlib
   requests (RFC 1950, `src/shader_library.h`'s inflater), and reports through status arrays, `ID3D12Fence` signals
   and events. BCPack, swizzle and physical-page requests are not done yet.
-  See [docs/directstorage.md](../docs/directstorage.md) for the ABI evidence and what is unverified.
+  See [docs/directstorage.md](../docs/directstorage.md) for the ABI evidence, the `LEONIDA_DSTORAGE_*` settings and what is unverified.
 
 - `gameinput.dll` / `xgameruntime.dll` — `GameInputCreate`: the v0 GameInput API for gamepads on SDL3
   (`shims/gameinput.cpp`), so any controller SDL supports works, with rumble, Xbox trigger rumble, force feedback
@@ -301,9 +301,10 @@ Current limits, by design:
 
 ### What `xgameruntime.dll` reports: environment overrides
 
-The `xgameruntime` shim (`shims/xgameruntime.cpp`) answers the title's questions about the console and its package
-with fixed values. Six environment variables change an answer, for trying another of the title's code paths. Each
-is read on every call, and a value that is empty or too long for its buffer is ignored; the row marked *diagnostic* only adds log lines.
+The `xgameruntime` shim (`shims/xgameruntime.cpp` and `shims/xgameruntime_*.cpp`) answers the title's questions about
+the console, user, saves, display, and package with fixed values. The environment variables below change an answer,
+for trying another of the title's code paths, or add diagnostics. Values that are empty or too long for their buffer
+are ignored; rows marked *diagnostic* only add log lines.
 `tests/test_docs_env_vars.py` fails when the runtime or `make_game.py` reads a `LEONIDA_*` variable that no
 document names.
 
@@ -316,6 +317,10 @@ document names.
 | `LEONIDA_PACKAGED` | `1` | `0`, or text that is not a number, makes `XPackageIsPackagedProcess` return false. Any other number keeps it true. |
 | `LEONIDA_TITLE_MEMORY_MB` | unset | Caps the title memory limit (in MiB, clamped to `2048..65536`) reported by both `XSystemGetAppMemoryUsageLimit` (`xgameruntime.cpp`) and `XMemGetWorkingSetStatistics` (`xmem.cpp`). Useful on 16 GB RAM / low-VRAM hosts to prevent oversized title pools; invalid or non-positive values are ignored and fall back to the host memory report. |
 | `LEONIDA_TRACE_XGAMESAVE` | unset | *Diagnostic.* `1` logs one `[rt] xgamesave:` line to stderr per `XGameSave*` and `XGameSaveFiles*` call (`shims/xgameruntime_gamesave.cpp`): the call, its handles, container and blob names, sizes and HRESULT, after `t=<ms since the process started>ms tid=<thread>`. An async call also logs when its job is scheduled, when its work runs (with how long it waited on the queue), when it completes and when the title collects it with the `...Result` call. Blob contents are never logged. Read once per process; unset, a call costs one load. |
+| `LEONIDA_GAMERTAG` | `"Player"` | Gamertag returned by `XUserGetGamertag` (`shims/xgameruntime_user.cpp`, up to 15 printable ASCII characters; see [docs/runtime_imports.md](../docs/runtime_imports.md)). |
+| `LEONIDA_HDR` | unset | `1` makes `XDisplayTryEnableHdrMode` report enabled (`shims/xgameruntime_offline.cpp`); unset leaves it disabled for SDR output ([docs/runtime_imports.md](../docs/runtime_imports.md)). |
+| `LEONIDA_LOG_GAME_EVENTS` | unset | *Diagnostic.* `1` logs every `XblEventsWriteInGameEvent` call (`shims/xgameruntime_offline.cpp`; [docs/runtime_imports.md](../docs/runtime_imports.md)). |
+| `LEONIDA_SAVE_DIR` | `%LOCALAPPDATA%\Leonida\saves` | Root directory for `XGameSave` and `XGameSaveFiles` containers (`shims/xgameruntime_gamesave.cpp`; [docs/saves.md](../docs/saves.md)). |
 | `LEONIDA_STACKS` | unset | Comma-separated whole seconds after the title's entry point is called (e.g. `90,180`). At each time `--run` suspends every other thread in turn just long enough to copy its context and stack, then unwinds the copy (title frames through the unwind tables the loader registers) and prints to stderr `[rt] stacks t=<s> thread <tid> (<thread description, or start address>):` and up to 40 `#i module+0xRVA` frames, innermost first; a chain identical to an earlier thread's prints `same as thread <tid>`. |
 
 ### Switches of the D3D12 layer for a retail boot
@@ -399,7 +404,7 @@ ones marked *diagnostic* only add log lines or exist to compare a run with and w
 | `LEONIDA_SLOT31_ASYNC` | unset | Trades correctness for speed. `1` makes queue slot 31 (`CopyPageMappingsBatchX`) signal the queue, hand a copy of its batches to one worker thread and return; the worker waits for that signal and maps them in call order (`shims/d3d12_xs_device.cpp`). A copy of the GPU-only window made before the worker gets there reads the old pages for a moment. Unset, the caller waits for the mapping. |
 | `LEONIDA_SLOT31_RUNS` | unset | `1` makes queue slot 31 unmap a run of pages whose mapping changes once and map one view for each stretch of consecutive pages of one section, instead of page by page (`shims/xmem.cpp`). Off by default because it was measured slower. |
 | `LEONIDA_SLOT31_CPU_TWIN` | unset | `1` repeats the page mappings queue slot 31 makes in the GPU view of the title's stream pool at the matching addresses of its CPU view (`shims/xmem.cpp`, read when the second of the pool's two reservations is noted). |
-| `LEONIDA_QUEUE_PAGE_MAPPINGS` | on | Read by `rt::xmem::queue_page_mappings_enabled()` (`shims/xmem.cpp`), where `0` turns it off. Nothing in the runtime calls that function, so the variable has no effect at present, and what it was meant to switch is not clear from the code. |
+| `LEONIDA_QUEUE_PAGE_MAPPINGS` | on | Together with `LEONIDA_SLOT31_RUNS=1`, enables the queue slot 31 `CopyPageMappingsBatchX` hook (`src/main.cpp`) and separate queue mappings for the stream pool's GPU-only view (`shims/xmem.cpp`). `0` disables both. |
 | `LEONIDA_POOL_ZERO_PAGES` | unset | `1` answers a read by title code of an unmapped page of an XMem physical-page window by mapping a zeroed read-only page there (a "zero plant", logged), taken under the physical-mapping lock (`shims/xmem.cpp`). Unset, only a write into such a page is backed with a zeroed page. |
 | `LEONIDA_TITLE_HEAP` | unset | `1` makes the title's `XMemAlloc` blocks come from a Win32 heap of their own instead of the CRT heap (`shims/xmem.cpp`), so a GPU store through a slot-133 import past a buffer's end, or into a freed block, cannot corrupt the runtime's own objects on the same page. |
 | `LEONIDA_XMEM_SEC_COMMIT` | on under Wine | XMem's physical-page sections are committed whole under Wine; `0` reserves them and commits each page at its first touch, as on Windows, where the variable has no effect (`shims/xmem.cpp`). |
@@ -447,6 +452,16 @@ ones marked *diagnostic* only add log lines or exist to compare a run with and w
 | `LEONIDA_MIRROR_EXACT` | unset | `1`: the device's fence-wait thread writes a console fence's mirror the moment the timeline reaches the next value, so the title sees a completion as soon as the runtime does; the thread-pool wait stays as the backstop for rewinds (`shims/d3d12_xs_device.cpp`). |
 | `LEONIDA_INPUT_STATS` | unset | *Diagnostic.* `1`: every 10 s, how the title asked for input readings (by method and device argument) and what it got (`shims/gameinput.cpp`). |
 | `LEONIDA_SAMPLE_FIND` | unset | *Diagnostic.* `<rva>[,<rva>...]` (hex, title function starts): every report of the thread sampler (`LEONIDA_SAMPLE_MS`) says which threads have the function on their stack (48 frames deep), how often, and their most frequent chain under it (`src/thread_sampler.h`). |
+| `LEONIDA_WRITE_DIR` | unset | Overrides the `--overlay` write root directory for an unattended run (`src/main.cpp`; [docs/boot.md](../docs/boot.md)). |
+| `LEONIDA_XMEM_BACKING_DIR` | unset | Directory for XMem physical-page section backing files (`src/main.cpp`, `shims/xmem.cpp`; `--first-run-ui` defaults it to `first-run-ui/xmem`; [docs/first_run_ui.md](../docs/first_run_ui.md)). |
+| `LEONIDA_PACKAGE_SPLASH` | on | `0` disables painting the package's declared splash image onto the title window (`shims/package_splash.cpp`; [docs/boot.md](../docs/boot.md)). |
+| `LEONIDA_CLZERO_PATCH` | on | `0` disables patching `clzero` loops at load (`src/clzero_patch.h`; [docs/cpu_features.md](../docs/cpu_features.md)). |
+| `LEONIDA_STUB_PIPELINES` | unset | *Diagnostic.* Non-`0` creates pipelines whose translated shader is missing as no-op stubs (`S_OK`) instead of failing (`shims/d3d12_vulkan_device.cpp`; [docs/boot.md](../docs/boot.md)). |
+| `LEONIDA_CBV_RAW` | unset | `1` uses `desc->SizeInBytes` instead of the 16-byte-row-aligned size when resolving CBV V# addresses (`shims/d3d12_vulkan_device.cpp`; [docs/buffer_bounds.md](../docs/buffer_bounds.md)). |
+| `LEONIDA_PRESENT_PLANE1` | on | `0` shows only plane 0 when `PresentX` receives two planes without the overlay flag; by default plane 1 is composed over plane 0 (`shims/xbox_present.cpp`). |
+| `LEONIDA_BVH_BUILDER` | unset | `console` disables the `XboxBvhBuilder` shim so the bundled DLL runs instead (`shims/xbox_bvh_builder.cpp`; [docs/xdxr.md](../docs/xdxr.md)). |
+| `LEONIDA_D3D12_LISTS` | unset | `pc` gives PC-shaped command lists instead of console-shaped lists (`shims/d3d12_xs.cpp`; [docs/d3d12_xs_console_abi.md](../docs/d3d12_xs_console_abi.md)). |
+| `LEONIDA_VALUE_WAIT_TIMEOUT_MS` | `200` | Timeout in milliseconds (`1..599999`) for `d3d12_xs_list_values` waits (`shims/d3d12_xs_list_values.h`; [docs/d3d12_xs_console_abi.md](../docs/d3d12_xs_console_abi.md)). |
 
 The two serializer functions and `D3D12XboxCreateDevice` are the only `d3d12_xs` imports used by the
 shipped DLLs (measured; see `docs/design.md` and `docs/d3d12_vulkan.md`). The game executable's own
