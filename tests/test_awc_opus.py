@@ -1138,11 +1138,12 @@ class MalformedBankTest(unittest.TestCase):
 
     def test_bad_magic_raises_value_error(self):
         with tempfile.TemporaryDirectory() as tmp:
-            path = os.path.join(tmp, "bad.awc")
-            with open(path, "wb") as f:
-                f.write(b"XATD" + b"\x00" * 60)
-            with self.assertRaises(ValueError):
-                awc.export_bank(path, os.path.join(tmp, "out"))
+            for bad in (b"XATD", struct.pack("<I", 0xAD740003), struct.pack(">I", 0xAD740003)):
+                path = os.path.join(tmp, "bad.awc")
+                with open(path, "wb") as f:
+                    f.write(bad + b"\x00" * 60)
+                with self.assertRaises(ValueError):
+                    awc.export_bank(path, os.path.join(tmp, "out"))
 
     def test_main_skips_bad_bank(self):
         with tempfile.TemporaryDirectory() as tmp:
