@@ -23,6 +23,9 @@ int main() {
     EXPECT(a.shader_va(title) == arena);
     EXPECT(a.shader_va(title + 0x123) == arena + 0x123);
     EXPECT(a.shader_va(title + size - 1) == arena + size - 1);
+    // Multi-byte spans: translated only when the whole span fits inside the range.
+    EXPECT(a.shader_va(title + size - 4, 4) == arena + size - 4);
+    EXPECT(a.shader_va(title + size - 4, 5) == title + size - 4);
     // Negative controls: one byte before, the end itself, and an arena VA are untouched.
     EXPECT(a.shader_va(title - 1) == title - 1);
     EXPECT(a.shader_va(title + size) == title + size);
@@ -48,6 +51,22 @@ int main() {
     EXPECT(!a.title_memory(0x40100000, mlo, mhi) && !a.title_memory(0x3FFFFFFF, mlo, mhi));
     a.remove_title_memory(0x40000000);
     EXPECT(!a.title_memory(0x40080000, mlo, mhi));
+    // Title memory merging, touching-disjoint ranges, generation counter, and arena overlap checks.
+    const auto gen0 = a.memory_generation();
+    a.add_title_memory(0x50000000, 0x10000);
+    a.add_title_memory(0x50008000, 0x18000);  // overlaps: merges into [0x50000000, 0x50020000)
+    a.add_title_memory(0x50020000, 0x10000);  // adjacent (end == next start): kept separate
+    EXPECT(a.memory_generation() == gen0 + 3);
+    const auto mem_ranges = a.title_memory_ranges();
+    EXPECT(mem_ranges.size() == 2 && mem_ranges[0].first == 0x50000000 && mem_ranges[0].second == 0x50020000 &&
+           mem_ranges[1].first == 0x50020000 && mem_ranges[1].second == 0x50030000);
+    EXPECT(a.title_overlap_end(0x4fff0000, 0x50000000) == 0);
+    EXPECT(a.title_overlap_end(0x4fff0000, 0x50000001) == 0x50020000);
+    EXPECT(a.title_overlap_end(0x50010000, 0x50011000) == 0x50020000);
+    EXPECT(a.title_overlap_end(0x50030000, 0x50040000) == 0);
+    a.remove_title_memory(0x50000000);
+    a.remove_title_memory(0x50020000);
+    EXPECT(a.title_memory_ranges().empty());
     // A wrapping target (an import below heap_base) is kept as is: modular arithmetic.
     constexpr std::uint64_t below = 0xFFFFFFFFFFF00000ull;
     EXPECT(a.add(title + 0x100000, size, below) && a.shader_va(title + 0x100010) == below + 0x10);
@@ -138,6 +157,24 @@ int main() {
     EXPECT(!a.shader_side(arena) && a.shader_side(0xA0000ff) && !a.shader_side(0xA000100));
     a.remove(title + 0x100, 0xA000000);
     EXPECT(a.size() == 0 && !a.shader_side(0xA000000));
+    // Removal recording is off by default; when enabled, it captures remove, overlapping add, and forget_copy.
+    std::vector<std::pair<std::uint64_t, std::uint64_t>> removed;
+    a.forget_copy(title, 0x40, arena);
+    a.take_removed(removed);
+    EXPECT(removed.empty());
+    a.record_removals(true);
+    EXPECT(a.add(title, 0x200, arena));
+    EXPECT(a.add(title + 0x100, 0x100, arena + 0x1000));  // replaces [title, title + 0x200)
+    a.remove(title + 0x100, arena + 0x1000);
+    a.forget_copy(title + 0x400, 0x80, arena + 0x2000);
+    a.take_removed(removed);
+    EXPECT(removed.size() == 3 &&
+           removed[0].first == arena && removed[0].second == 0x200 &&
+           removed[1].first == arena + 0x1000 && removed[1].second == 0x100 &&
+           removed[2].first == arena + 0x2000 && removed[2].second == 0x80);
+    a.take_removed(removed);
+    EXPECT(removed.empty());
+    a.record_removals(false);
     std::printf("title_va_alias: translation inside a title-placed range, identity outside it and after release\n");
     return 0;
 }

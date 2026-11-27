@@ -65,6 +65,10 @@ static int test_hash() {
     e.text("a");
     e.text("bc");
     CHECK(d.digest() != e.digest());  // text is length-prefixed
+    journal::Hasher empty_text, null_text;
+    empty_text.text("");
+    null_text.text(nullptr);
+    CHECK(empty_text.digest() == null_text.digest());
     return 0;
 }
 
@@ -153,6 +157,11 @@ static int test_accounting() {
     const auto out = journal::plan_eviction(entries, 150, 100);
     CHECK(out.size() == 2 && out[0] == 0 && out[1] == 2);
     CHECK(journal::plan_eviction(entries, 0, 0).size() == 4);
+    // Equal timestamps tie-break deterministically by path; target >= total evicts nothing.
+    const std::vector<journal::EntryInfo> tied = {{"z", 40, t0}, {"a", 40, t0}};
+    const auto tied_out = journal::plan_eviction(tied, 50, 40);
+    CHECK(tied_out.size() == 1 && tied_out[0] == 1);
+    CHECK(journal::plan_eviction(tied, 50, 80).empty());
     return 0;
 }
 
@@ -165,6 +174,8 @@ static int test_names() {
     CHECK(journal::staging_name("cs-0123456789abcdef.bin.tmp.123456.0"));
     CHECK(!journal::staging_name("cs-0123456789abcdef.bin.tmp.123456"));
     CHECK(!journal::staging_name("cs-0123456789abcdef.bin.tmp.12x.0"));
+    CHECK(!journal::staging_name("cs-0123456789abcdef.bin.tmp..0"));
+    CHECK(!journal::staging_name("cs-0123456789abcdef.bin.tmp.1."));
     CHECK(!journal::staging_name("pipeline_cache.session.bin.tmp.1.0"));  // the session file's, swept elsewhere
     return 0;
 }
@@ -186,14 +197,19 @@ static int test_tidy(const fs::path& root) {
     put_file(b, 400, now - hours(1));
     put_file(c, 400, now - hours(3));
     const fs::path old_stage = a.string() + ".tmp.111.0", new_stage = b.string() + ".tmp.222.1";
+    const fs::path exact_stage = c.string() + ".tmp.333.2", just_under_stage = c.string() + ".tmp.444.3";
     put_file(old_stage, 50, now - minutes(30));
     put_file(new_stage, 50, now - minutes(2));
+    put_file(exact_stage, 50, now - minutes(10));
+    put_file(just_under_stage, 50, now - minutes(9));
     put_file(dir / "notes.txt", 999, now - hours(9));
 
-    // Under the budget: only the old staging file goes; the young one may still be being written.
+    // Under the budget: staging files at or past staging_age go; younger ones may still be being written.
     auto result = journal::tidy(dir, 2000, minutes(10), now);
-    CHECK(result.swept == 1 && result.evicted == 0 && result.entries == 3 && result.bytes == 1200);
-    CHECK(!fs::exists(old_stage) && fs::exists(new_stage) && fs::exists(dir / "notes.txt"));
+    CHECK(result.swept == 2 && result.evicted == 0 && result.entries == 3 && result.bytes == 1200);
+    CHECK(!fs::exists(old_stage) && !fs::exists(exact_stage) && fs::exists(new_stage) &&
+          fs::exists(just_under_stage) && fs::exists(dir / "notes.txt"));
+    fs::remove(just_under_stage);
 
     // Over it: the least recently used go until three quarters is left (1200 > 1000; 750 holds b alone).
     result = journal::tidy(dir, 1000, minutes(10), now);
@@ -291,8 +307,10 @@ static int test_overlay(const fs::path& dir) {
     const auto refreshed = fs::last_write_time(dst);
     CHECK(refreshed > entry.used);
     entry = journal::read_with_seed(dst, seed, id, runtime);
-    journal::touch_local_hit(dst, entry, now + std::chrono::minutes(30));
+    journal::touch_local_hit(dst, entry, now + std::chrono::minutes(59));
     CHECK(fs::last_write_time(dst) == refreshed);
+    journal::touch_local_hit(dst, entry, now + journal::touch_after);
+    CHECK(fs::last_write_time(dst) > refreshed);
     used = journal::tidy(roots.writable, 0);
     CHECK(used.evicted == 1 && used.bytes == 0 && !fs::exists(dst));
     CHECK(journal::read_entry(src, id) == donor && fs::last_write_time(src) == donor_time);
@@ -305,7 +323,8 @@ static int test_overlay(const fs::path& dir) {
     };
     CHECK(disabled({}, seed) && disabled(local, "relative") && disabled(local, dir / "no-seed"));
     CHECK(disabled(local, src) && disabled(src, seed));
-    CHECK(disabled(seed / ".", seed) && disabled(seed / "missing" / "journal", seed) && disabled(dir, seed));
+    CHECK(disabled(seed / ".", seed) && disabled(seed / "sub", seed) &&
+          disabled(seed / "missing" / "journal", seed) && disabled(dir, seed));
 #ifdef _WIN32
     if (fs::exists(dir / "SEED")) CHECK(disabled(dir / "SEED", seed));
 #endif
