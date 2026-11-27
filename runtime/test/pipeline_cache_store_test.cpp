@@ -48,6 +48,26 @@ static int test_limit() {
     CHECK(store::over_save_limit(14 * gib, 9 * gib, 4 * gib));     // 5 GB added is over 4
     CHECK(!store::over_save_limit(4 * gib, 9 * gib, 1));           // smaller than the seed: nothing added
     CHECK(!store::over_save_limit(4 * gib + 1, 1, 4 * gib));       // exactly at the limit once the seed is taken off
+    // Zero limit ("off" / strict): only zero added bytes pass.
+    CHECK(!store::over_save_limit(0, 0, 0));
+    CHECK(!store::over_save_limit(512, 512, 0));
+    CHECK(!store::over_save_limit(256, 512, 0));
+    CHECK(store::over_save_limit(1, 0, 0));
+    CHECK(store::over_save_limit(513, 512, 0));
+    // Boundary characters around '0'..'9' and exact size_t::max() + 1 overflow.
+    CHECK(store::parse_save_limit("0000").valid);
+    CHECK(store::parse_save_limit("0000").bytes == 0);
+    for (const char* text : {"/", ":"}) {
+        const auto limit = store::parse_save_limit(text);
+        CHECK(!limit.valid);
+        CHECK(limit.bytes == default_save_limit);
+    }
+    std::string overflow = largest;
+    overflow.back() = static_cast<char>(overflow.back() + 1);
+    CHECK(!store::parse_save_limit(overflow.c_str()).valid);
+    CHECK(store::parse_save_limit(overflow.c_str()).bytes == default_save_limit);
+    CHECK(!store::over_save_limit(std::numeric_limits<std::size_t>::max(), 0,
+                                  std::numeric_limits<std::size_t>::max()));
     return 0;
 }
 
@@ -70,6 +90,7 @@ static int test_header() {
     CHECK(store::header_matches(blob, sizeof(blob), identity));
 
     // Too short and null are "no cache", never a read past the end.
+    CHECK(!store::header_matches(header, 0, identity));
     CHECK(!store::header_matches(header, store::header_bytes - 1, identity));
     CHECK(!store::header_matches(nullptr, store::header_bytes, identity));
 
@@ -80,6 +101,7 @@ static int test_header() {
         put32(changed + offset, value);
         return !store::header_matches(changed, sizeof(changed), identity);
     };
+    CHECK(differs(0, store::header_bytes - 4));
     CHECK(differs(0, store::header_bytes + 4));
     CHECK(differs(4, store::header_version_one + 1));
     CHECK(differs(8, identity.vendor + 1));
@@ -92,6 +114,10 @@ static int test_header() {
     leonida::cached_pso::Identity swapped = identity;
     swapped.vendor = 0x02100000;
     CHECK(!store::header_matches(header, sizeof(header), swapped));
+    // Driver version is not part of VkPipelineCacheHeaderVersionOne; cache_uuid carries the driver identity.
+    leonida::cached_pso::Identity other_driver = identity;
+    other_driver.driver = identity.driver + 1;
+    CHECK(store::header_matches(header, sizeof(header), other_driver));
     return 0;
 }
 
