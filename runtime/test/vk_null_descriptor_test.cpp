@@ -94,7 +94,11 @@ int run(vktest::Device& d, const VkPhysicalDeviceMemoryProperties& memory, bool 
     std::memset(result_map, 0xcd, result_words * 4);
     std::memcpy(key_map, keys.data(), sizeof(keys));
 
+#ifdef LEONIDA_TEST_NULL_DESCRIPTORS_SPV
     const std::vector<std::uint32_t> code = load_spirv(LEONIDA_TEST_NULL_DESCRIPTORS_SPV);
+#else
+    const std::vector<std::uint32_t> code;
+#endif
     EXPECT(!code.empty());
     VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
     module_info.codeSize = code.size() * 4;
